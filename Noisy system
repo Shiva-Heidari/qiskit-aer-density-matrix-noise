@@ -1,0 +1,189 @@
+# ---------------------------------------------------------------
+# Simulating quantum circuits with Aer density-matrix + clean noise model
+# ---------------------------------------------------------------
+# Optional install (uncomment if needed):
+# !pip install "qiskit-aer>=0.14" "qiskit-terra>=0.25" numpy
+
+from __future__ import annotations
+import numpy as np
+from math import pi
+from copy import deepcopy
+
+# Core Qiskit: circuits and transpiler
+from qiskit import QuantumCircuit, transpile
+
+# Quantum information utilities for analysis
+from qiskit.quantum_info import DensityMatrix, partial_trace, state_fidelity, Pauli
+
+# Aer simulator backend
+from qiskit_aer import AerSimulator
+
+# Noise objects and prebuilt channels
+from qiskit_aer.noise import (
+    NoiseModel,
+    depolarizing_error,
+    thermal_relaxation_error,
+    ReadoutError,
+)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def purity(rho: np.ndarray) -> float:
+    """Return state purity Tr(rho^2). =1 for pure states; <1 for mixed."""
+    return float(np.real_if_close(np.trace(rho @ rho)))
+
+def bloch_vector(rho: np.ndarray) -> np.ndarray:
+    """Return (⟨X⟩, ⟨Y⟩, ⟨Z⟩) for a 1-qubit density matrix (diagnoses decoherence)."""
+    return np.array([
+        np.real_if_close(np.trace(rho @ Pauli("X").to_matrix())),
+        np.real_if_close(np.trace(rho @ Pauli("Y").to_matrix())),
+        np.real_if_close(np.trace(rho @ Pauli("Z").to_matrix())),
+    ], dtype=float)
+
+def run_and_get_dm(circ: QuantumCircuit, simulator: AerSimulator) -> np.ndarray:
+    """
+    Run `circ` on `simulator` and return the final density matrix as a NumPy array.
+    - We call save_density_matrix() to record ρ at the end of the circuit.
+    - We transpile so that noise attaches to basis gates actually executed.
+    """
+    c = circ.copy()                     # keep original circuit untouched
+    c.save_density_matrix()             # tell Aer to save final density matrix
+    tqc = transpile(c, simulator)       # map to backend basis ops (important for noise)
+    result = simulator.run(tqc).result()
+    dm = result.data(0)["density_matrix"]  # a qiskit.quantum_info.DensityMatrix
+    return np.asarray(dm, dtype=complex)   # return as ndarray for easy math
+
+# -----------------------------
+# Simulators (noiseless & noisy)
+# -----------------------------
+# Noiseless density-matrix simulator: evolves ρ exactly (CPTP channels if present)
+sim_dm_clean = AerSimulator(method="density_matrix")
+
+# -----------------------------
+# Noise model (clean composition → no warnings)
+# -----------------------------
+# Create a container for gate-specific noise channels
+noise = NoiseModel()
+
+# Use modern 1-qubit basis ops; H/U decompose into these under transpilation
+oneq_ops = ["id", "rz", "sx", "x"]
+
+# Physical parameters (tweak to explore regimes)
+p1 = 0.01              # depolarizing probability per 1q gate (isotropic Pauli noise)
+T1 = 50e-6             # energy relaxation time (seconds)
+T2 = 40e-6             # dephasing time (seconds)
+gate_time_1q = 35e-9   # duration of a 1q gate (seconds) → amount of relaxation applied
+
+# Build individual 1q errors:
+# - depolarizing mixes the Bloch vector isotropically
+# - thermal_relaxation applies T1/T2 decay over the specified gate time
+depol_1q = depolarizing_error(p1, 1)
+therm_1q = thermal_relaxation_error(T1, T2, gate_time_1q)
+
+# Combine both effects into a single channel for clarity (avoids duplicate-add warnings).
+# Order is a modeling choice; therm.compose(depol) ≈ apply depolarizing then relaxation.
+combined_1q = therm_1q.compose(depol_1q)
+
+# Attach the combined 1q noise to every qubit for the given instructions
+noise.add_all_qubit_quantum_error(combined_1q, oneq_ops)
+
+# OPTIONAL: add CX noise (2-qubit)
+add_cx_noise = True
+if add_cx_noise:
+    p2 = 0.02              # depolarizing prob per 2q gate (often larger than 1q)
+    gate_time_2q = 250e-9  # CX duration (longer gate → more relaxation exposure)
+
+    depol_2q = depolarizing_error(p2, 2)
+    # Relaxation on both qubits during CX: tensor two single-qubit thermal channels
+    therm_2q = thermal_relaxation_error(T1, T2, gate_time_2q).tensor(
+        thermal_relaxation_error(T1, T2, gate_time_2q)
+    )
+    combined_2q = therm_2q.compose(depol_2q)
+
+    # Attach to the CX instruction
+    noise.add_all_qubit_quantum_error(combined_2q, ["cx"])
+
+# Build the noisy density-matrix simulator with the noise model attached
+sim_dm_noisy = AerSimulator(method="density_matrix", noise_model=noise)
+
+# -----------------------------
+# 1) Single-qubit: prepare |+> and compare
+# -----------------------------
+# Circuit: |0> --H--> |+>
+qc_plus = QuantumCircuit(1, name="H_to_plus")
+qc_plus.h(0)
+
+# Noiseless result (reference)
+rho_clean = run_and_get_dm(qc_plus, sim_dm_clean)
+print("Noiseless |+> density matrix:\n", np.round(rho_clean, 3))
+print("Purity (should be 1.0):", round(purity(rho_clean), 6))
+print("Bloch (~[1,0,0]):", np.round(bloch_vector(rho_clean), 3))
+
+# Noisy result (with depolarizing + relaxation)
+rho_noisy = run_and_get_dm(qc_plus, sim_dm_noisy)
+print("\nNoisy |+> density matrix:\n", np.round(rho_noisy, 3))
+print("Purity (< 1.0):", round(purity(rho_noisy), 6))
+print("Bloch (shrunk toward origin):", np.round(bloch_vector(rho_noisy), 3))
+
+# Similarity to ideal |+> (state fidelity)
+fid_plus = state_fidelity(DensityMatrix(rho_clean), DensityMatrix(rho_noisy))
+print("Fidelity to ideal |+>:", round(fid_plus, 6))
+
+# -----------------------------
+# 2) Two-qubit Bell state: entanglement & reductions
+# -----------------------------
+# Prepare |Φ+> = (|00> + |11>)/√2 using H on qubit 0 followed by CX
+bell = QuantumCircuit(2, name="bell")
+bell.h(0)
+bell.cx(0, 1)
+
+# Noiseless Bell state (globally pure)
+rho2_clean = run_and_get_dm(bell, sim_dm_clean)
+print("\nNoiseless Bell ρ shape:", rho2_clean.shape)
+print("Noiseless Bell purity:", round(purity(rho2_clean), 6))
+
+# Reduced single-qubit state: trace out qubit 1 → maximally mixed I/2 (signature of entanglement)
+rhoA = partial_trace(DensityMatrix(rho2_clean), [1]).data
+print("Reduced ρ of qubit 0 (≈ I/2):\n", np.round(rhoA, 3))
+print("Purity of reduced (~0.5):", round(purity(rhoA), 6))
+
+# Noisy Bell: entanglement degrades due to 2q + relaxation noise
+rho2_noisy = run_and_get_dm(bell, sim_dm_noisy)
+print("\nNoisy Bell purity:", round(purity(rho2_noisy), 6))
+fid_bell = state_fidelity(DensityMatrix(rho2_clean), DensityMatrix(rho2_noisy))
+print("Fidelity to ideal Bell:", round(fid_bell, 6))
+
+# -----------------------------
+# 3) Optional readout error demo (counts skew)
+# -----------------------------
+# Readout error models classical confusion in measurement outcomes (no change to ρ pre-meas).
+enable_readout_demo = True
+if enable_readout_demo:
+    p_meas = 0.02
+    # Symmetric bit-flip matrix: [[P(0|0), P(1|0)], [P(0|1), P(1|1)]]
+    ro = ReadoutError([[1 - p_meas, p_meas], [p_meas, 1 - p_meas]])
+
+    # Make a safe copy of the current noise model and add readout confusion
+    noise_with_ro = deepcopy(noise)                      # (NoiseModel has no .copy())
+    noise_with_ro.add_all_qubit_readout_error(ro)
+
+    # Simulator with identical state noise + readout error attached
+    sim_dm_meas = AerSimulator(method="density_matrix", noise_model=noise_with_ro)
+
+    # Prepare |+> and measure in Z: ideally 50/50, with readout error → slight skew
+    meas = QuantumCircuit(1, 1)
+    meas.h(0)
+    meas.measure(0, 0)
+
+    meas_t = transpile(meas, sim_dm_meas)
+    res = sim_dm_meas.run(meas_t, shots=5000).result()
+    print("\nCounts with readout error (~50/50 but slightly skewed):", res.get_counts())
+
+# -----------------------------
+# Notes / variations
+# -----------------------------
+# - Increase p1/p2 or reduce T1/T2 to see stronger decoherence / lower fidelities.
+# - Remove CX noise by setting add_cx_noise = False (helps isolate 1q vs 2q effects).
+# - Change gate_time_1q / gate_time_2q to reflect your target hardware.
+# - Density-matrix scales as 4^n (memory); keep qubit counts modest for speed.
