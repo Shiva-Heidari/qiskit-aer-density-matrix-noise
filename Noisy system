@@ -5,7 +5,7 @@
 # !pip install "qiskit-aer>=0.14" "qiskit-terra>=0.25" numpy
 
 from __future__ import annotations
-import numpy as np
+import numpy as np 
 from math import pi
 from copy import deepcopy
 
