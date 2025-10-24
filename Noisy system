@@ -1,8 +1,6 @@
 # ---------------------------------------------------------------
 # Simulating quantum circuits with Aer density-matrix + clean noise model
 # ---------------------------------------------------------------
-# Optional install (uncomment if needed):
-# !pip install "qiskit-aer>=0.14" "qiskit-terra>=0.25" numpy
 
 from __future__ import annotations
 import numpy as np 
